@@ -1,129 +1,130 @@
 # Description
 
-A simple shell script to make new server comfortable.
+A simple Shell script for bootstrapping an Ubuntu server environment.
 
 # Compatibility
 
-Tested on Ubuntu 20.04 only. Other Debian based system should work.
+Currently tested only on Ubuntu 24.10. Other Debian-based systems may also work in theory, but the Docker installation flow in the script is written against Docker's official Ubuntu repository setup.
 
-# Guarantee
+# Risk Notice
 
-There is not any guarantee. Use at your own risk.
+This script modifies system-level configuration including the hostname, `/etc/hosts`, users, `sudoers`, Docker, swap, and `/etc/fstab`. No guarantees are provided. Use it at your own risk.
+
+It is better suited for a fresh machine and is not recommended for direct use on an existing production environment.
 
 # Usage
 
-```
-wget -nv -O- https://raw.githubusercontent.com/maptile/server-scripts/main/install.sh | sudo sh /dev/stdin
-```
-
-# Extras
-
-## Create user ubuntu
-
-If the server doesn't have ubuntu user, it's better to create it.
-
-```
-sudo useradd -m -s /bin/bash ubuntu
+```sh
+wget -nv -O- https://raw.githubusercontent.com/maptile/server-scripts/refs/heads/main/install.sh | sudo bash /dev/stdin
 ```
 
-If you don't want to type password when using sudo, append the following lines to /etc/sudoers.d/90-cloud-init-users
+When the script runs, all interaction happens once at the beginning:
 
+1. It asks for the target hostname, defaulting to the current hostname.
+2. It suggests a default swap size based on the current memory size and lets you override it.
+3. It prompts you to paste SSH public keys, supporting multiple lines, and ends on an empty line.
+
+After the installation steps begin, there will be no further interactive input in the middle of the process.
+
+# `root` Login Scenario
+
+If the server initially only allows `root` login and there is no `ubuntu` user yet, the script will automatically do the following:
+
+1. Install `sudo` if it is not already present.
+2. Create the `ubuntu` user.
+3. Add `ubuntu` to the `sudo` group.
+4. Write a passwordless sudo rule to `/etc/sudoers.d/90-server-bootstrap-ubuntu`.
+5. Apply later user-level setup such as dotfiles, SSH public keys, and Docker group membership to the `ubuntu` account.
+
+# SSH and Login Restrictions
+
+The script writes the public keys you paste during installation into the target user's `~/.ssh/authorized_keys`.
+
+After installation completes, it also downloads the following file into the target user's home directory:
+
+```text
+~/disable-root-login.sh
 ```
-ubuntu ALL=(ALL) NOPASSWD:ALL
+
+This script comes from:
+
+```text
+https://raw.githubusercontent.com/maptile/server-scripts/refs/heads/main/disable-root-login.sh
 ```
 
-Add the coresponding pub keys to ~/.ssh/authorized_keys
+When needed, it updates `PermitRootLogin` and `PasswordAuthentication` in `sshd_config` to `no`, then restarts `sshd`.
 
-## Change sshd config
+It is recommended to confirm SSH public-key login works first, and then run it manually.
 
-```
-sudo vim /etc/ssh/sshd_config
-```
+# Script Overview
 
-change PermitRootLogin to no and PasswordAuthentication no
+The script first performs a basic system update and upgrade, then installs or configures the following components.
 
-Restart sshd server by
+## Hostname
 
-```
-sudo systemctl restart sshd.service
-```
+At the beginning of the installation, the script sets the system hostname based on your input. The default is the current hostname.
 
-# Look Inside
+To avoid later `sudo` warnings caused by inconsistent hostname resolution, it also updates the hostname associated with `127.0.0.1` in `/etc/hosts`.
 
-This script will do basic system update and upgrade first. And will install the following components.
+## System Tools
 
-## apt-transport-https
+Installed via `apt`:
 
-**transitional package for https support**
+- `apt-transport-https`
+- `ca-certificates`
+- `curl`
+- `git`
+- `gpg-agent`
+- `gnupg`
+- `software-properties-common`
+- `stow`
+- `tmux`
+- `vim`
 
-This package enables the usage of 'deb https://foo distro main' lines in the /etc/apt/sources.list so that all package managers using the libapt-pkg library can access metadata and packages available in sources accessible over https (Hypertext Transfer Protocol Secure).
+## `dotfiles`
 
-This transport supports server as well as client authentication with certificates.
+The script clones and enables this repository:
 
-## ca-certificates
+- <https://github.com/maptile/dotfiles.git>
 
-**Common CA certificates**
+By default it installs into `~/.dotfiles` under the target user's home directory, then applies it with `stow`.
 
-Contains the certificate authorities shipped with Mozilla's browser to allow SSL-based applications to check for the authenticity of SSL connections.
+## Docker
 
-## curl
+The script will:
 
-**command line tool for transferring data with URL syntax**
+1. Remove old Docker-related packages.
+2. Add Docker's official Ubuntu repository and GPG key.
+3. Install the following components:
+   `docker-ce`, `docker-ce-cli`, `containerd.io`, `docker-buildx-plugin`, `docker-compose-plugin`
+4. Add the target user to the `docker` group.
 
-curl is a command line tool for transferring data with URL syntax, supporting DICT, FILE, FTP, FTPS, GOPHER, HTTP, HTTPS, IMAP, IMAPS, LDAP, LDAPS, POP3, POP3S, RTMP, RTSP, SCP, SFTP, SMTP, SMTPS, TELNET and TFTP.
+## BBR
 
-## gpg-agent
+The script will:
 
-**GNU privacy guard - cryptographic agent**
+1. Write `net.core.default_qdisc=fq` and `net.ipv4.tcp_congestion_control=bbr` to `/etc/sysctl.d/999-custom-kernel-bbr.conf` if that file does not already exist.
+2. Run `sysctl --system`.
+3. Print the resulting BBR-related sysctl values.
 
-GnuPG is GNU's tool for secure communication and data storage. It can be used to encrypt data and to create digital signatures. It includes an advanced key management facility and is compliant with the proposed OpenPGP Internet standard as described in RFC4880.
+## Swap
 
-## software-properties-common
+The script will:
 
-**manage the repositories that you install software from**
+1. Create `/swapfile1` based on your input.
+2. Enable that swap file.
+3. Write the persistent configuration to `/etc/fstab`.
+4. Set `vm.swappiness` to `10`.
 
-This software provides an abstraction of the used apt repositories. It allows you to easily manage your distribution and independent software vendor software sources.
+# Current Behavior Notes
 
-## stow
+Refer to the current [`install.sh`](/workspace/install.sh) as the source of truth.
 
-**Organizer for /usr/local software packages**
+The current script does not install the following items that were mentioned in older documentation:
 
-GNU Stow is a software installation manager for /usr/local. Using symbolic links, GNU Stow helps you keep the installations separate (/usr/local/stow/emacs vs. /usr/local/stow/perl, for example) while maintaining the illusion that they are all under /usr/local.
-
-## tmux
-
-**terminal multiplexer**
-
-tmux enables a number of terminals (or windows) to be accessed and controlled from a single terminal like screen. tmux runs as a server-client system. A server is created automatically when necessary and holds a number of sessions, each of which may have a number of windows linked to it. Any number of clients may connect to a session, or the server may be controlled by issuing commands with tmux. Communication takes place through a socket, by default placed in /tmp. Moreover tmux provides a consistent and well-documented command interface, with the same syntax whether used interactively, as a key binding, or from the shell. It offers a choice of vim or Emacs key layouts.
-
-## vim
-
-**Vi IMproved - enhanced vi editor**
-
-Vim is an almost compatible version of the UNIX editor Vi.
-
-## Docker Community Edition
-
-[Docker](https://docs.docker.com/get-docker/) is an open platform for developing, shipping, and running applications. Docker enables you to separate your applications from your infrastructure so you can deliver software quickly.
-
-## Docker Compose
-
-[Compose](https://docs.docker.com/compose/) is a tool for defining and running multi-container Docker applications.
-
-## snap core
-
-**snapd runtime environment**
-
-The core runtime environment for [snapd](https://snapcraft.io/).
-
-## certbot
-
-[Certbot](https://certbot.eff.org) is a free, open source software tool for automatically using Let’s Encrypt certificates on manually-administrated websites to enable HTTPS.
-
-## dotfiles
-
-[A simple tuning](https://github.com/maptile/dotfiles) for git and tmux.
+- `snap core`
+- `certbot`
 
 # License
 
-Licensed under MIT License.
+Released under the MIT License.
