@@ -7,7 +7,7 @@ GREEN='\033[0;32m'
 NC='\033[0m'
 
 # Repository-hosted helper script downloaded near the end of bootstrap.
-DISABLE_ROOT_LOGIN_SCRIPT_URL='https://raw.githubusercontent.com/maptile/server-scripts/refs/heads/main/disable-root-login.sh'
+DISABLE_ROOT_LOGIN_SCRIPT_URL='https://raw.githubusercontent.com/maptile/server-bootstrap/refs/heads/main/disable-root-login.sh'
 
 # The script may start as root, but user-level assets should end up under the target user.
 TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"

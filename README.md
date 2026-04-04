@@ -15,7 +15,7 @@ It is better suited for a fresh machine and is not recommended for direct use on
 # Usage
 
 ```sh
-wget -nv -O- https://raw.githubusercontent.com/maptile/server-scripts/refs/heads/main/install.sh | sudo bash /dev/stdin
+wget -nv -O- https://raw.githubusercontent.com/maptile/server-bootstrap/refs/heads/main/install.sh | sudo bash /dev/stdin
 ```
 
 When the script runs, all interaction happens once at the beginning:
@@ -49,7 +49,7 @@ After installation completes, it also downloads the following file into the targ
 This script comes from:
 
 ```text
-https://raw.githubusercontent.com/maptile/server-scripts/refs/heads/main/disable-root-login.sh
+https://raw.githubusercontent.com/maptile/server-bootstrap/refs/heads/main/disable-root-login.sh
 ```
 
 When needed, it updates `PermitRootLogin` and `PasswordAuthentication` in `sshd_config` to `no`, then restarts `sshd`.
