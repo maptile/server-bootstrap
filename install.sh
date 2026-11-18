@@ -8,6 +8,7 @@ NC='\033[0m'
 
 BASE_PACKAGES=(ca-certificates curl git gnupg gpg-agent kmod mount procps stow sudo tmux vim)
 DOCKER_PACKAGES=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+DISTRIBUTION=''
 DOCKER_URL=''
 DOCKER_SUITE=''
 DEFAULT_USER=''
@@ -39,9 +40,11 @@ detect_distribution() {
     local ID='' VERSION_CODENAME='' UBUNTU_CODENAME=''
     [ -r /etc/os-release ] || fail 'Cannot read /etc/os-release.'
     . /etc/os-release
+    DISTRIBUTION="${ID}"
 
     case "${ID}" in
         debian)
+            BASE_PACKAGES+=(locales)
             DOCKER_SUITE="${VERSION_CODENAME}"
             DEFAULT_USER='debian'
             ;;
@@ -256,6 +259,15 @@ configure_hostname() {
         hostname "${TARGET_HOSTNAME}"
         printf '%s\n' "${TARGET_HOSTNAME}" > /etc/hostname
     fi
+}
+
+configure_locale() {
+    [ "${DISTRIBUTION}" = 'debian' ] || return 0
+
+    log "Configuring en_US.UTF-8 locale"
+    sed -i 's/^# *en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen
+    locale-gen
+    update-locale LANG=en_US.UTF-8
 }
 
 configure_docker_repository() (
@@ -488,6 +500,7 @@ log "Upgrading base system"
 apt-get -y upgrade
 log "Installing common dependencies"
 apt-get install -y "${BASE_PACKAGES[@]}"
+configure_locale
 log "Removing unused components"
 apt-get -y autoremove
 
