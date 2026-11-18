@@ -6,113 +6,144 @@ set -euo pipefail
 GREEN='\033[0;32m'
 NC='\033[0m'
 
-# Repository-hosted helper script downloaded near the end of bootstrap.
-DISABLE_ROOT_LOGIN_SCRIPT_URL='https://raw.githubusercontent.com/maptile/server-bootstrap/refs/heads/main/disable-root-login.sh'
-
-# The script may start as root, but user-level assets should end up under the target user.
-TARGET_USER="${SUDO_USER:-${USER:-$(id -un)}}"
+BASE_PACKAGES=(ca-certificates curl git gnupg gpg-agent kmod mount procps stow sudo tmux vim)
+DOCKER_PACKAGES=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
+DOCKER_URL=''
+DOCKER_SUITE=''
+DEFAULT_USER=''
+TARGET_USER=''
 TARGET_HOME=""
+CURRENT_HOSTNAME=""
 TARGET_HOSTNAME=""
 SWAP_SIZE=""
 SSH_KEYS_INPUT=""
+HAS_TTY=false
 
 log() {
     echo -e "${GREEN}$1${NC}"
 }
 
+fail() {
+    printf '%s\n' "$1" >&2
+    exit 1
+}
+
 # This bootstrap changes system state heavily, so it must run with root privileges.
 require_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        echo "Please run this script with sudo or as root."
-        exit 1
+        fail 'Run this script with sudo or as root.'
     fi
 }
 
-# Some minimal images do not ship with sudo.
-ensure_sudo_installed() {
-    if ! command -v sudo >/dev/null 2>&1; then
-        log "Installing sudo"
-        apt-get update
-        apt-get install -y sudo
+detect_distribution() {
+    local ID='' VERSION_CODENAME='' UBUNTU_CODENAME=''
+    [ -r /etc/os-release ] || fail 'Cannot read /etc/os-release.'
+    . /etc/os-release
+
+    case "${ID}" in
+        debian)
+            DOCKER_SUITE="${VERSION_CODENAME}"
+            DEFAULT_USER='debian'
+            ;;
+        ubuntu)
+            DOCKER_SUITE="${UBUNTU_CODENAME:-${VERSION_CODENAME}}"
+            DEFAULT_USER='ubuntu'
+            ;;
+        *)
+            fail "Unsupported distribution: ${ID:-unknown}. Use Debian or Ubuntu."
+            ;;
+    esac
+
+    [ -n "${DOCKER_SUITE}" ] || fail "No release codename found for ${ID}."
+    DOCKER_URL="https://download.docker.com/linux/${ID}"
+    log "Detected ${ID} (${DOCKER_SUITE})"
+}
+
+select_target_user() {
+    TARGET_USER="${SUDO_USER:-$(id -un)}"
+    if [ "${TARGET_USER}" = 'root' ]; then
+        TARGET_USER="${DEFAULT_USER}"
     fi
 }
 
-# When the machine only has root access, create the conventional ubuntu user
-# and grant passwordless sudo so the rest of the setup can target that account.
-ensure_ubuntu_user() {
-    if ! id -u ubuntu >/dev/null 2>&1; then
-        log "Creating ubuntu user"
-        useradd -m -s /bin/bash ubuntu
+# A direct root login uses the distribution's default bootstrap account.
+ensure_default_user() (
+    local sudoers_file="/etc/sudoers.d/90-server-bootstrap-${DEFAULT_USER}"
+    local rule="${DEFAULT_USER} ALL=(ALL) NOPASSWD:ALL" tmp_sudoers
+
+    if ! id -u "${DEFAULT_USER}" >/dev/null 2>&1; then
+        log "Creating ${DEFAULT_USER} user"
+        useradd -m -s /bin/bash "${DEFAULT_USER}"
+    fi
+    usermod -aG sudo "${DEFAULT_USER}"
+
+    if [ -f "${sudoers_file}" ] && [ "$(cat "${sudoers_file}")" = "${rule}" ]; then
+        return
     fi
 
-    usermod -aG sudo ubuntu
+    log "Configuring passwordless sudo for ${DEFAULT_USER}"
+    tmp_sudoers="$(mktemp "${sudoers_file}.XXXXXX")"
+    trap 'rm -f -- "${tmp_sudoers}"' EXIT
+    printf '%s\n' "${rule}" > "${tmp_sudoers}"
+    chmod 0440 "${tmp_sudoers}"
+    visudo -cf "${tmp_sudoers}"
+    mv -f -- "${tmp_sudoers}" "${sudoers_file}"
+)
 
-    local sudoers_file='/etc/sudoers.d/90-server-bootstrap-ubuntu'
-    if [ ! -f "${sudoers_file}" ] || ! grep -q '^ubuntu ALL=(ALL) NOPASSWD:ALL$' "${sudoers_file}" 2>/dev/null; then
-        log "Configuring passwordless sudo for ubuntu"
-        echo 'ubuntu ALL=(ALL) NOPASSWD:ALL' > "${sudoers_file}"
-        chmod 0440 "${sudoers_file}"
-    fi
-}
-
-# Resolve which user should own home-directory changes.
 prepare_target_user() {
-    require_root
-
-    if [ "$(id -un)" = 'root' ] && [ "${TARGET_USER}" = 'root' ]; then
-        ensure_sudo_installed
-        ensure_ubuntu_user
-        TARGET_USER='ubuntu'
+    local entry
+    if [ "${SUDO_USER:-root}" = 'root' ]; then
+        ensure_default_user
     fi
 
-    TARGET_HOME="$(eval echo "~${TARGET_USER}")"
+    entry="$(getent passwd "${TARGET_USER}")" || fail "User ${TARGET_USER} not found."
+    TARGET_HOME="$(cut -d: -f6 <<< "${entry}")"
 
-    if [ ! -d "${TARGET_HOME}" ]; then
-        echo "Home directory for ${TARGET_USER} not found."
-        exit 1
-    fi
+    [ -d "${TARGET_HOME}" ] || fail "Home directory for ${TARGET_USER} not found."
 }
 
 # Run user-scoped commands with the target user's environment and HOME.
 run_as_target_user() {
-    sudo -H -u "${TARGET_USER}" bash -lc "$1"
+    sudo -H -u "${TARGET_USER}" -- "$@"
 }
 
 # Ask for the target hostname before any long-running changes start.
 prompt_hostname() {
-    local current_hostname reply
-    current_hostname="$(hostname)"
+    local reply
+    CURRENT_HOSTNAME="$(hostname)"
 
-    if [ -r /dev/tty ]; then
-        printf "Enter hostname [%s]: " "${current_hostname}" > /dev/tty
-        if read -r reply < /dev/tty && [ -n "${reply}" ]; then
+    if "${HAS_TTY}"; then
+        printf "Enter hostname [%s]: " "${CURRENT_HOSTNAME}" >&3
+        if read -r reply <&3 && [ -n "${reply}" ]; then
             TARGET_HOSTNAME="${reply}"
         else
-            TARGET_HOSTNAME="${current_hostname}"
+            TARGET_HOSTNAME="${CURRENT_HOSTNAME}"
         fi
     else
-        TARGET_HOSTNAME="${current_hostname}"
+        TARGET_HOSTNAME="${CURRENT_HOSTNAME}"
         printf "No interactive terminal detected, using current hostname: %s\n" "${TARGET_HOSTNAME}"
     fi
 }
 
-# Default swap size matches physical memory, rounded to whole MiB.
+# Reuse active swap, or default to physical memory rounded to whole MiB.
 detect_default_swap_size() {
     local mem_total_kb mem_total_mib
+    if awk 'NR > 1 && $1 != "/swapfile1" {found = 1} END {exit !found}' /proc/swaps; then
+        echo 0
+        return
+    fi
     mem_total_kb="$(awk '/MemTotal/ {print $2}' /proc/meminfo)"
     mem_total_mib="$(((mem_total_kb + 1023) / 1024))"
     echo "${mem_total_mib}M"
 }
 
-# Ask for swap size before making any irreversible system changes.
 prompt_swap_size() {
     local default_swap_size reply
     default_swap_size="$(detect_default_swap_size)"
 
-    if [ -r /dev/tty ]; then
-        printf "Detected memory size: %s\n" "${default_swap_size}" > /dev/tty
-        printf "Enter swap size (for example 2G, 4096M) [%s]: " "${default_swap_size}" > /dev/tty
-        if read -r reply < /dev/tty && [ -n "${reply}" ]; then
+    if "${HAS_TTY}"; then
+        printf "Enter swap size (for example 2G, 4096M, or 0 to skip) [%s]: " "${default_swap_size}" >&3
+        if read -r reply <&3 && [ -n "${reply}" ]; then
             SWAP_SIZE="${reply}"
         else
             SWAP_SIZE="${default_swap_size}"
@@ -125,31 +156,16 @@ prompt_swap_size() {
 
 # Allow the operator to paste one or more SSH public keys, ending with a blank line.
 prompt_ssh_keys() {
-    local line first_line=1
+    local line
 
-    if [ ! -r /dev/tty ]; then
+    if ! "${HAS_TTY}"; then
         printf "No interactive terminal detected, skipping SSH public key input.\n"
         return
     fi
 
-    printf "Paste SSH public keys for %s. Submit an empty line to finish.\n" "${TARGET_USER}" > /dev/tty
-
-    while true; do
-        if ! IFS= read -r line < /dev/tty; then
-            break
-        fi
-
-        if [ -z "${line}" ]; then
-            break
-        fi
-
-        if [ ${first_line} -eq 1 ]; then
-            SSH_KEYS_INPUT="${line}"
-            first_line=0
-        else
-            SSH_KEYS_INPUT="${SSH_KEYS_INPUT}
-${line}"
-        fi
+    printf "Paste SSH public keys for %s. Submit an empty line to finish.\n" "${TARGET_USER}" >&3
+    while IFS= read -r line <&3 && [ -n "${line}" ]; do
+        SSH_KEYS_INPUT+="${line}"$'\n'
     done
 }
 
@@ -157,8 +173,8 @@ ${line}"
 # package-maintainer prompts can still receive key input even though the script was
 # started via 'bash /dev/stdin'.
 reattach_stdin_to_tty() {
-    if [ ! -t 0 ] && [ -r /dev/tty ]; then
-        exec </dev/tty
+    if "${HAS_TTY}"; then
+        exec <&3 3>&-
     fi
 }
 
@@ -170,95 +186,147 @@ install_ssh_keys() {
     fi
 
     log "Installing SSH public keys for ${TARGET_USER}"
-    install -d -m 0700 -o "${TARGET_USER}" -g "${TARGET_USER}" "${TARGET_HOME}/.ssh"
-    touch "${TARGET_HOME}/.ssh/authorized_keys"
-    chown "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/.ssh/authorized_keys"
-    chmod 0600 "${TARGET_HOME}/.ssh/authorized_keys"
-
-    while IFS= read -r key_line; do
-        [ -n "${key_line}" ] || continue
-        if ! grep -Fqx "${key_line}" "${TARGET_HOME}/.ssh/authorized_keys"; then
-            printf '%s\n' "${key_line}" >> "${TARGET_HOME}/.ssh/authorized_keys"
-        fi
-    done <<__SSH_KEYS__
-${SSH_KEYS_INPUT}
-__SSH_KEYS__
+    run_as_target_user bash -euc '
+        umask 077
+        install -d -m 0700 "${HOME}/.ssh"
+        keys="${HOME}/.ssh/authorized_keys"
+        touch "${keys}"
+        chmod 0600 "${keys}"
+        while IFS= read -r key_line; do
+            [ -n "${key_line}" ] || continue
+            if ! grep -Fqx -- "${key_line}" "${keys}"; then
+                printf "%s\n" "${key_line}" >> "${keys}"
+            fi
+        done
+    ' <<< "${SSH_KEYS_INPUT}"
 }
 
 # Keep /etc/hosts aligned with the chosen hostname so sudo does not warn about name resolution.
-# Update the existing host entry for the machine IP instead of appending a new hostname.
+# Preserve aliases and comments when updating the machine's host entry.
 sync_hosts_hostname() {
-    local current_hostname desired_hostname primary_ip target_ip tmp_hosts
-    current_hostname="$(hostname)"
-    desired_hostname="${TARGET_HOSTNAME}"
-    primary_ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    local primary_ip target_ip tmp_hosts
+    primary_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
     target_ip=""
 
     if [ -n "${primary_ip}" ] && awk -v ip="${primary_ip}" '$1 == ip {found = 1} END {exit !found}' /etc/hosts; then
         target_ip="${primary_ip}"
     elif awk '$1 == "127.0.1.1" {found = 1} END {exit !found}' /etc/hosts; then
         target_ip='127.0.1.1'
-    elif awk -v host="${current_hostname}" '$1 == "127.0.0.1" {for (i = 2; i <= NF; ++i) if ($i == host) found = 1} END {exit !found}' /etc/hosts; then
+    elif awk -v host="${CURRENT_HOSTNAME}" '$1 == "127.0.0.1" {for (i = 2; i <= NF && $i !~ /^#/; ++i) if ($i == host) found = 1} END {exit !found}' /etc/hosts; then
         target_ip='127.0.0.1'
     fi
 
-    if [ -z "${target_ip}" ]; then
-        return
-    fi
-
     tmp_hosts="$(mktemp)"
-    awk -v ip="${target_ip}" -v host="${desired_hostname}" '
-        $1 == ip {
-            if (ip == "127.0.0.1") {
-                print ip, "localhost", host
-            } else {
-                print ip, host
+    awk -v ip="${target_ip}" -v old="${CURRENT_HOSTNAME}" -v host="${TARGET_HOSTNAME}" '
+        ip != "" && $1 == ip && !updated {
+            names = ""
+            found = 0
+            for (i = 2; i <= NF && $i !~ /^#/; ++i) {
+                name = $i
+                if (name == old && name != "localhost") name = host
+                if (name == host && found) continue
+                if (name == host) found = 1
+                names = names " " name
             }
+            if (!found) names = names " " host
+            comment = index($0, "#")
+            print ip "\t" substr(names, 2) (comment ? " " substr($0, comment) : "")
+            updated = 1
             next
         }
         {print}
+        END {
+            if (!updated) print "127.0.1.1\t" host
+        }
     ' /etc/hosts > "${tmp_hosts}"
-    cat "${tmp_hosts}" > /etc/hosts
-    rm -f "${tmp_hosts}"
+    if ! cmp -s "${tmp_hosts}" /etc/hosts; then
+        cat "${tmp_hosts}" > /etc/hosts
+    fi
+    rm -f -- "${tmp_hosts}"
 }
 
 # Apply the requested hostname and persist it through the system hostname files.
 configure_hostname() {
+    [ "${TARGET_HOSTNAME}" != "${CURRENT_HOSTNAME}" ] || return 0
     log "Setting hostname to ${TARGET_HOSTNAME}"
 
-    if command -v hostnamectl >/dev/null 2>&1; then
+    if [ -d /run/systemd/system ] && command -v hostnamectl >/dev/null 2>&1; then
         hostnamectl set-hostname "${TARGET_HOSTNAME}"
     else
-        echo "${TARGET_HOSTNAME}" > /etc/hostname
         hostname "${TARGET_HOSTNAME}"
+        printf '%s\n' "${TARGET_HOSTNAME}" > /etc/hostname
     fi
 }
 
-# Retry the Docker GPG key download until it succeeds or the operator aborts.
-download_docker_gpg_key() {
-    local gpg_tmp
-    gpg_tmp="$(mktemp)"
+configure_docker_repository() (
+    local arch tmp_dir
+    arch="$(dpkg --print-architecture)"
+    tmp_dir="$(mktemp -d)"
+    trap 'rm -rf -- "${tmp_dir}"' EXIT
 
-    while true; do
-        if curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --batch --yes --dearmor -o "${gpg_tmp}"; then
-            install -m 0644 "${gpg_tmp}" /etc/apt/keyrings/docker.gpg
-            rm -f "${gpg_tmp}"
-            return
-        fi
+    log "Configuring the Docker stable repository for ${DOCKER_SUITE}/${arch}"
+    curl -fsSL --retry 3 --connect-timeout 10 --max-time 60 \
+        "${DOCKER_URL}/gpg" -o "${tmp_dir}/docker.asc"
+    cat > "${tmp_dir}/docker.sources" <<EOF
+Types: deb
+URIs: ${DOCKER_URL}
+Suites: ${DOCKER_SUITE}
+Components: stable
+Architectures: ${arch}
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF
+    install -d -m 0755 /etc/apt/keyrings /etc/apt/sources.list.d
+    install -m 0644 "${tmp_dir}/docker.asc" /etc/apt/keyrings/docker.asc
+    install -m 0644 "${tmp_dir}/docker.sources" /etc/apt/sources.list.d/docker.sources
+)
 
-        rm -f "${gpg_tmp}"
-        log "Docker GPG download failed, retrying in 1 second. Press Ctrl+C to abort."
-        sleep 1
-        gpg_tmp="$(mktemp)"
-    done
+prepare_package_sources() {
+    local legacy_source='/etc/apt/sources.list.d/docker.list'
+    # APT cannot load the old and new entries together when their signing keys differ.
+    if [ -f "${legacy_source}" ]; then
+        log "Migrating ${legacy_source} to docker.sources"
+        mv --backup=numbered -- "${legacy_source}" "${legacy_source}.disabled"
+    fi
+
+    if ! command -v curl >/dev/null 2>&1 || [ ! -s /etc/ssl/certs/ca-certificates.crt ]; then
+        apt-get update --error-on=any
+        apt-get install -y ca-certificates curl
+    fi
+    configure_docker_repository
+    apt-get update --error-on=any
 }
 
-# Keep the SSH hardening helper as a standalone file in the user's home directory.
-download_disable_root_login_script() {
-    log "Downloading disable-root-login.sh for ${TARGET_USER}"
-    curl -fsSL "${DISABLE_ROOT_LOGIN_SCRIPT_URL}" -o "${TARGET_HOME}/disable-root-login.sh"
-    chown "${TARGET_USER}:${TARGET_USER}" "${TARGET_HOME}/disable-root-login.sh"
-    chmod +x "${TARGET_HOME}/disable-root-login.sh"
+install_docker() {
+    local package
+    local -a conflicts=()
+    for package in docker docker-engine docker.io docker-compose docker-compose-v2 docker-doc \
+        docker-buildx podman-docker containerd runc; do
+        if [ "$(dpkg-query -W -f='${db:Status-Status}' "${package}" 2>/dev/null)" = installed ]; then
+            conflicts+=("${package}-")
+        fi
+    done
+
+    # Install Docker and remove conflicting packages in a single APT transaction.
+    log "Installing Docker"
+    apt-get install -y "${DOCKER_PACKAGES[@]}" "${conflicts[@]}"
+    if ! getent group docker >/dev/null 2>&1; then
+        groupadd docker
+    fi
+    usermod -aG docker "${TARGET_USER}"
+}
+
+install_dotfiles() {
+    log "Installing dotfiles"
+    run_as_target_user bash -euc '
+        cd -- "${HOME}"
+        if [ -d .dotfiles ]; then
+            git -C .dotfiles pull --ff-only
+        else
+            git clone https://github.com/maptile/dotfiles.git .dotfiles
+        fi
+        cd .dotfiles
+        stow .
+    '
 }
 
 # Adjust the default Bash prompt so kitty sessions use color and the username
@@ -271,132 +339,172 @@ update_bashrc_prompt() {
         return
     fi
 
-    sed -i         -e 's/xterm-color|\*-256color) color_prompt=yes;;/xterm-color|xterm-kitty|*-256color) color_prompt=yes;;/'         -e 's/01;32m/01;36m/g'         "${bashrc_path}"
-
-    chown "${TARGET_USER}:${TARGET_USER}" "${bashrc_path}"
+    run_as_target_user sed -i \
+        -e 's/xterm-color|\*-256color) color_prompt=yes;;/xterm-color|xterm-kitty|*-256color) color_prompt=yes;;/' \
+        -e 's/01;32m/01;36m/g' \
+        -- "${bashrc_path}"
 }
 
-prepare_target_user
+configure_bbr() {
+    local config='/etc/sysctl.d/999-custom-kernel-bbr.conf'
+    local algorithms='/proc/sys/net/ipv4/tcp_available_congestion_control'
+    if [ ! -f "${config}" ]; then
+        if ! grep -qw bbr "${algorithms}" 2>/dev/null; then
+            modprobe tcp_bbr 2>/dev/null || true
+        fi
+        if ! grep -qw bbr "${algorithms}" 2>/dev/null; then
+            log "BBR is unavailable on the running kernel, skipping BBR configuration"
+            return
+        fi
+        log "Enabling BBR"
+        sysctl -w net.core.default_qdisc=fq net.ipv4.tcp_congestion_control=bbr
+        printf '%s\n' 'net.core.default_qdisc=fq' 'net.ipv4.tcp_congestion_control=bbr' > "${config}"
+    fi
+    sysctl net.core.default_qdisc net.ipv4.tcp_congestion_control
+}
+
+create_swapfile() (
+    local swapfile="$1" tmp_swap
+    tmp_swap="$(mktemp "${swapfile}.XXXXXX")"
+    trap 'rm -f -- "${tmp_swap}"' EXIT
+
+    if [ "$(stat -f -c %T -- "${tmp_swap}")" = btrfs ]; then
+        # Btrfs swap files require copy-on-write to be disabled before allocation.
+        if ! command -v chattr >/dev/null 2>&1; then
+            apt-get install -y e2fsprogs
+        fi
+        chattr +C "${tmp_swap}"
+    fi
+    fallocate -l "${SWAP_SIZE}" -- "${tmp_swap}"
+    mkswap "${tmp_swap}"
+    mv -T -- "${tmp_swap}" "${swapfile}"
+)
+
+configure_swap() {
+    local swapfile='/swapfile1'
+    local config='/etc/sysctl.d/999-custom-swappiness.conf'
+    if [ "${SWAP_SIZE}" = 0 ]; then
+        log "Skipping swapfile configuration"
+        return
+    fi
+
+    log "Configuring swap"
+    if [ ! -e "${swapfile}" ]; then
+        create_swapfile "${swapfile}"
+        if ! swapon "${swapfile}"; then
+            rm -f -- "${swapfile}"
+            fail "Could not activate ${swapfile}."
+        fi
+    elif ! awk -v file="${swapfile}" '$1 == file {found = 1} END {exit !found}' /proc/swaps; then
+        swapon "${swapfile}"
+    fi
+
+    if ! awk -v file="${swapfile}" '$1 == file && $3 == "swap" {found = 1} END {exit !found}' /etc/fstab; then
+        printf '\n%s none swap sw 0 0\n' "${swapfile}" >> /etc/fstab
+    fi
+    if [ ! -f "${config}" ]; then
+        sysctl -w vm.swappiness=10
+        printf '%s\n' 'vm.swappiness=10' > "${config}"
+    fi
+}
+
+harden_ssh() (
+    local config='/etc/ssh/sshd_config'
+    local config_dir='/etc/ssh/sshd_config.d'
+    local drop_in="${config_dir}/00-server-bootstrap.conf"
+    local temp_dir effective
+    local restore_config=false reload_attempted=false
+
+    if ! command -v sshd >/dev/null 2>&1; then
+        log 'OpenSSH server is not installed, skipping SSH hardening'
+        return
+    fi
+    [ -f "${config}" ] || fail "OpenSSH configuration not found: ${config}"
+    sshd -t -f "${config}"
+    mkdir -p -- "${config_dir}"
+    temp_dir="$(mktemp -d "${config_dir}/.server-bootstrap.XXXXXX")"
+
+    # Roll back the drop-in if validation or reloading fails.
+    trap '
+        if "${restore_config}"; then
+            if [ -e "${temp_dir}/previous" ] || [ -L "${temp_dir}/previous" ]; then
+                mv -T -- "${temp_dir}/previous" "${drop_in}" ||
+                    fail "Could not restore the SSH configuration from ${temp_dir}/previous."
+            else
+                rm -f -- "${drop_in}" || fail "Could not remove ${drop_in}."
+            fi
+            if "${reload_attempted}" && ! systemctl reload ssh.service; then
+                printf "%s\n" "Original SSH configuration was restored on disk, but reloading it failed." >&2
+            fi
+        fi
+        rm -rf -- "${temp_dir}"
+    ' EXIT
+
+    if [ -e "${drop_in}" ] || [ -L "${drop_in}" ]; then
+        cp -a -- "${drop_in}" "${temp_dir}/previous"
+    fi
+    printf '%s\n' 'PermitRootLogin no' 'PasswordAuthentication no' > "${temp_dir}/new"
+    chmod 0644 "${temp_dir}/new"
+    restore_config=true
+    mv -T -- "${temp_dir}/new" "${drop_in}"
+
+    sshd -t -f "${config}"
+    effective="$(sshd -T -f "${config}")"
+    if ! grep -Fxq 'permitrootlogin no' <<< "${effective}" ||
+        ! grep -Fxq 'passwordauthentication no' <<< "${effective}"; then
+        fail "OpenSSH did not apply both settings from ${drop_in}. Check Include and option precedence."
+    fi
+
+    # A daemon started later, including through ssh.socket, reads the new configuration.
+    if systemctl is-active --quiet ssh.service 2>/dev/null; then
+        reload_attempted=true
+        systemctl reload ssh.service || fail 'Could not reload ssh.service.'
+    fi
+    restore_config=false
+    log "SSH settings applied through ${drop_in}"
+)
+
+[ "$#" -eq 0 ] || fail 'Run install.sh without arguments.'
+require_root
+export PATH="/usr/local/sbin:/usr/sbin:/sbin:${PATH}"
+detect_distribution
+exec 9>/run/lock/server-bootstrap.lock
+flock -n 9 || fail 'Another server bootstrap is running.'
+select_target_user
+if { exec 3<>/dev/tty; } 2>/dev/null; then
+    HAS_TTY=true
+fi
 prompt_hostname
 prompt_swap_size
 prompt_ssh_keys
 reattach_stdin_to_tty
-sync_hosts_hostname
-install_ssh_keys
 
 log "Using target user: ${TARGET_USER}"
 log "Using hostname: ${TARGET_HOSTNAME}"
 log "Using swap size: ${SWAP_SIZE}"
 
-log "Changing to home directory"
-cd "${TARGET_HOME}"
-
-configure_hostname
-
-# Bring the base system up to date first.
+prepare_package_sources
 log "Upgrading base system"
-apt-get -y update
 apt-get -y upgrade
-
-# Install the base toolchain needed by this bootstrap.
 log "Installing common dependencies"
-apt-get install -y \
-    apt-transport-https \
-    ca-certificates \
-    curl \
-    git \
-    gpg-agent \
-    gnupg \
-    software-properties-common \
-    stow \
-    tmux \
-    vim
-
-log "Remove unused components"
+apt-get install -y "${BASE_PACKAGES[@]}"
+log "Removing unused components"
 apt-get -y autoremove
 
-# Clone and apply the author's dotfiles for the target user.
-log "Install dotfiles"
-run_as_target_user "
-cd '${TARGET_HOME}'
-if [ ! -d ./.dotfiles ]; then
-    git clone https://github.com/maptile/dotfiles.git ./.dotfiles
-else
-    git -C ./.dotfiles pull --ff-only
-fi
-cd ./.dotfiles
-stow .
-"
+prepare_target_user
+configure_hostname
+sync_hosts_hostname
+install_ssh_keys
+install_docker
+log "Installed package versions"
+dpkg-query -W -f='${Package}\t${Version}\n' "${BASE_PACKAGES[@]}" "${DOCKER_PACKAGES[@]}"
 
-# Replace any distro-provided Docker packages with Docker's official packages.
-log "Installing docker"
-DOCKER_OLD_PACKAGES=()
-for pkg in docker docker-engine docker.io containerd runc; do
-    if dpkg -s "${pkg}" >/dev/null 2>&1; then
-        DOCKER_OLD_PACKAGES+=("${pkg}")
-    fi
-done
-if [ ${#DOCKER_OLD_PACKAGES[@]} -gt 0 ]; then
-    apt-get remove -y "${DOCKER_OLD_PACKAGES[@]}"
-fi
-
-install -m 0755 -d /etc/apt/keyrings
-download_docker_gpg_key
-chmod a+r /etc/apt/keyrings/docker.gpg
-
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-  $(. /etc/os-release && echo \"$VERSION_CODENAME\") stable" | \
-  tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-apt-get update
-
-apt-get -y install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-if ! getent group docker >/dev/null 2>&1; then
-    groupadd docker
-fi
-usermod -aG docker "${TARGET_USER}"
-
-# Enable BBR if the custom sysctl file does not already exist.
-log "Enabling BBR"
-if [ ! -f /etc/sysctl.d/999-custom-kernel-bbr.conf ]; then
-    echo 'net.core.default_qdisc=fq' | tee -a /etc/sysctl.d/999-custom-kernel-bbr.conf
-    echo 'net.ipv4.tcp_congestion_control=bbr' | tee -a /etc/sysctl.d/999-custom-kernel-bbr.conf
-    sysctl --system
-fi
-
-log "Enabling BBR result"
-sysctl net.core.default_qdisc
-sysctl net.ipv4.tcp_congestion_control
-
-# Leave an existing swapfile alone on reruns.
-log "Configuring swap"
-if [ -e /swapfile1 ]; then
-    log "Swapfile already exists, skipping swap configuration"
-else
-    fallocate -l "${SWAP_SIZE}" /swapfile1
-    chown root:root /swapfile1
-    chmod 0600 /swapfile1
-    mkswap /swapfile1
-    swapon /swapfile1
-
-    if [ ! -f /etc/sysctl.d/999-custom-swappiness.conf ]; then
-        echo 'vm.swappiness=10' | tee -a /etc/sysctl.d/999-custom-swappiness.conf
-    fi
-
-    if ! grep -q '/swapfile1 none swap sw 0 0' /etc/fstab; then
-        sed -i '$ a\
-/swapfile1 none swap sw 0 0\
-' /etc/fstab
-    fi
-fi
-
+install_dotfiles
 update_bashrc_prompt
-download_disable_root_login_script
+configure_bbr
+configure_swap
+harden_ssh
 
 echo -e "${GREEN}
 DONE.
-Please consider more steps:
-* review and run ${TARGET_HOME}/disable-root-login.sh after confirming SSH key login works
-* logout and login as ${TARGET_USER}, then you can run docker commands without sudo${NC}"
+Open a new login session as ${TARGET_USER} to run Docker commands without sudo.${NC}"
