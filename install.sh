@@ -6,7 +6,7 @@ set -euo pipefail
 GREEN='\033[0;32m'
 NC='\033[0m'
 
-BASE_PACKAGES=(ca-certificates curl git gnupg gpg-agent kmod mount procps stow sudo tmux vim)
+BASE_PACKAGES=(ca-certificates curl git gnupg gpg-agent jq kmod mount procps stow sudo tmux vim)
 DOCKER_PACKAGES=(docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin)
 DISTRIBUTION=''
 DOCKER_URL=''

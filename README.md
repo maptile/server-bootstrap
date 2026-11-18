@@ -40,21 +40,9 @@ If the server initially only allows `root` login and there is no `ubuntu` user y
 
 The script writes the public keys you paste during installation into the target user's `~/.ssh/authorized_keys`.
 
-After installation completes, it also downloads the following file into the target user's home directory:
+At the end of installation, `install.sh` sets both `PermitRootLogin` and `PasswordAuthentication` to `no` through `/etc/ssh/sshd_config.d/00-server-bootstrap.conf`.
 
-```text
-~/disable-root-login.sh
-```
-
-This script comes from:
-
-```text
-https://raw.githubusercontent.com/maptile/server-bootstrap/refs/heads/main/disable-root-login.sh
-```
-
-When needed, it updates `PermitRootLogin` and `PasswordAuthentication` in `sshd_config` to `no`, then restarts `sshd`.
-
-It is recommended to confirm SSH public-key login works first, and then run it manually.
+The script validates the SSH configuration and checks that both settings take effect before reloading `ssh.service` if it is active. If validation or reloading fails, it restores the previous drop-in configuration.
 
 # Script Overview
 
@@ -76,6 +64,7 @@ Installed via `apt`:
 - `git`
 - `gpg-agent`
 - `gnupg`
+- `jq`
 - `software-properties-common`
 - `stow`
 - `tmux`
